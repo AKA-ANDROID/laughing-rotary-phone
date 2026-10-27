@@ -1,0 +1,45 @@
+name: gold-alert
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Send a test Telegram message only"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gold-alert
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run alert check
+        run: python alert.py ${{ github.event.inputs.test == 'true' && 'test' || '' }}
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVEDATA_KEY: ${{ secrets.TWELVEDATA_KEY }}
+          DISPLAY_TZ: "UTC"
+      - name: Save state
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "alert-bot"
+            git config user.email "alert-bot@users.noreply.github.com"
+            git add state.json
+            git commit -m "update alert state"
+            git push
+          fi
