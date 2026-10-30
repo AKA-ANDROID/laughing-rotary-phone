@@ -1,13 +1,15 @@
 """XAUUSD liquidity-sweep alert -> Telegram.
 
 Rules (short side; the long side is the exact mirror):
-  1. 4H trend is DOWN: last swing high < previous swing high AND last swing low < previous swing low.
+  1. 4H, 2H and 1H trends are ALL down (each: last swing high < previous swing high AND
+     last swing low < previous swing low). If they disagree, no alert.
   2. On 5m, take the most recent confirmed swing high that is lower than the swing high before it (the LH).
   3. A candle trades above the LH (the sweep), then price closes back below the LH:
        - wick sweep: the sweep candle itself closes below the LH, or
        - engulf sweep: within 3 candles a candle closes below the LOW of the candle that made the sweep high
          (and below the LH).
-  4. Alert fires when that closing candle completes.
+  4. The sweep must poke at least MIN_SWEEP_DEPTH beyond the level (filters tiny 20-cent pokes).
+  5. Alert fires when that closing candle completes.
 A swing high/low = highest/lowest of 2 candles on each side.
 """
 import json
@@ -26,6 +28,10 @@ ENGULF_WINDOW = 3       # max candles after the sweep starts to close back
 REQUIRE_TRUE_LH = True  # swept level must be a real lower high (or higher low for longs)
 CHECK_LAST = 3          # re-check last N closed 5m candles, so a delayed run doesn't miss one
 STALE_MINUTES = 30      # ignore data older than this (market closed / feed stuck)
+MIN_SWEEP_DEPTH = 0.50  # dollars the sweep must poke beyond the swept level
+HTF = {"4H": 240, "2H": 120, "1H": 60}  # higher timeframes (minutes) that must all agree
+HTF_OFFSET_HOURS = 0    # shift higher-timeframe candle boundaries if they don't match your chart
+FETCH_5M = 4000         # 5m candles fetched; higher timeframes are built from these (1 data call per run)
 STATE_FILE = "state.json"
 # --------------------------------------------------------
 
@@ -74,6 +80,16 @@ def mirror(df):
     return m
 
 
+def resample(df5, minutes, last_end):
+    """Build higher-timeframe candles from 5m candles; keep only fully closed ones."""
+    r = (df5.set_index("time")
+         .resample(f"{minutes}min", offset=pd.Timedelta(hours=HTF_OFFSET_HOURS))
+         .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+         .dropna()
+         .reset_index())
+    return r[r["time"] + timedelta(minutes=minutes) <= last_end].reset_index(drop=True)
+
+
 def swings(df, kind):
     """Indices of confirmed swing highs ('high') or swing lows ('low')."""
     v = df[kind].values
@@ -87,12 +103,12 @@ def swings(df, kind):
     return out
 
 
-def trend_4h(df4):
-    sh, sl = swings(df4, "high"), swings(df4, "low")
+def trend_of(d):
+    sh, sl = swings(d, "high"), swings(d, "low")
     if len(sh) < 2 or len(sl) < 2:
         return None
-    h_prev, h_last = df4["high"][sh[-2]], df4["high"][sh[-1]]
-    l_prev, l_last = df4["low"][sl[-2]], df4["low"][sl[-1]]
+    h_prev, h_last = d["high"][sh[-2]], d["high"][sh[-1]]
+    l_prev, l_last = d["low"][sl[-2]], d["low"][sl[-1]]
     if h_last < h_prev and l_last < l_prev:
         return "down"
     if h_last > h_prev and l_last > l_prev:
@@ -122,6 +138,8 @@ def find_short_sweep(sub):
         if (seg["close"] < P).any() or sub["close"][t] >= P:
             continue                              # already closed back (alerted before) or not yet
         extreme = sub["high"].iloc[s:t + 1].max()
+        if extreme - P < MIN_SWEEP_DEPTH:
+            continue                              # poke too small to count as a real sweep
         if t == s:
             return {"level": P, "extreme": extreme, "kind": "wick sweep"}
         k = seg["high"].idxmax()                  # candle that made the sweep high
@@ -161,16 +179,19 @@ def main():
         print("market closed")
         return
 
-    df4 = closed_only(fetch("4h", 120), 240, now_naive)
-    df5 = closed_only(fetch("5min", 300), 5, now_naive)
+    df5 = closed_only(fetch("5min", FETCH_5M), 5, now_naive)
     if df5.empty or now_naive - df5["time"].iloc[-1] > timedelta(minutes=STALE_MINUTES):
         print("5m data is stale, skipping")
         return
 
-    trend = trend_4h(df4)
-    print("4H trend:", trend)
-    if trend is None:
+    last_end = df5["time"].iloc[-1] + timedelta(minutes=5)
+    trends = {name: trend_of(resample(df5, m, last_end)) for name, m in HTF.items()}
+    print("Trends:", trends)
+    values = set(trends.values())
+    if len(values) != 1 or None in values:
+        print("timeframes disagree or no clear trend, no alert")
         return
+    trend = values.pop()
 
     work = df5 if trend == "down" else mirror(df5)
     state = load_state()
@@ -192,7 +213,7 @@ def main():
                f"Swept level: {level:.2f}\n"
                f"Sweep extreme (stop reference): {extreme:.2f}\n"
                f"Trigger candle closed: {when:%d %b %H:%M} {when.tzname()}\n"
-               f"4H trend: {trend}. Go check the chart.")
+               f"Trend: 4H {trends['4H']}, 2H {trends['2H']}, 1H {trends['1H']}. Go check the chart.")
         send_telegram(msg)
         state["sent"].append(key)
         changed = True
