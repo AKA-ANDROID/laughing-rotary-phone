@@ -9,6 +9,10 @@ on:
         description: "Send a test Telegram message only"
         type: boolean
         default: false
+      backtest:
+        description: "Print sweeps found in the last 3 days (no Telegram messages)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -28,7 +32,7 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - name: Run alert check
-        run: python alert.py ${{ github.event.inputs.test == 'true' && 'test' || '' }}
+        run: python alert.py ${{ github.event.inputs.test == 'true' && 'test' || github.event.inputs.backtest == 'true' && 'backtest' || '' }}
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
