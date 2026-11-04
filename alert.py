@@ -1,8 +1,12 @@
 """XAUUSD liquidity-sweep alert -> Telegram.
 
 Rules (short side; the long side is the exact mirror):
-  1. 4H, 2H and 1H trends are ALL down (each: last swing high < previous swing high AND
-     last swing low < previous swing low). If they disagree, no alert.
+  1. 4H, 2H and 1H trends are ALL down. If the three disagree, no alert.
+       - 2H and 1H: "down" after a candle closes below the last confirmed swing low, until a candle
+         closes above the last confirmed swing high (up is the mirror).
+       - 4H (TREND_4H_MODE = "engulf"): a bullish 4H candle that is consumed (a close below its open)
+         by the next 1-2 candles flips the trend to down; a bearish one consumed upward flips it to up.
+         The trend holds until the opposite event.
   2. On 5m, take the most recent confirmed swing high that is lower than the swing high before it (the LH).
   3. A candle trades above the LH (the sweep), then price closes back below the LH:
        - wick sweep: the sweep candle itself closes below the LH, or
@@ -25,11 +29,13 @@ import requests
 SYMBOL = "XAU/USD"
 SWING_N = 2             # candles on each side for a swing high/low
 ENGULF_WINDOW = 3       # max candles after the sweep starts to close back
-REQUIRE_TRUE_LH = True  # swept level must be a real lower high (or higher low for longs)
+REQUIRE_TRUE_LH = False # True = swept level must be a real lower high / higher low (not equal or flat levels)
 CHECK_LAST = 3          # re-check last N closed 5m candles, so a delayed run doesn't miss one
 STALE_MINUTES = 30      # ignore data older than this (market closed / feed stuck)
 MIN_SWEEP_DEPTH = 0.50  # dollars the sweep must poke beyond the swept level
 HTF = {"4H": 240, "2H": 120, "1H": 60}  # higher timeframes (minutes) that must all agree
+TREND_4H_MODE = "engulf"  # "engulf" = 4H trend from candle engulfing; "structure" = swing-break trend
+ENGULF_4H_WINDOW = 2    # a 4H candle counts as consumed if one of the next N 4H candles closes beyond its open
 HTF_OFFSET_HOURS = 0    # shift higher-timeframe candle boundaries if they don't match your chart
 FETCH_5M = 4000         # 5m candles fetched; higher timeframes are built from these (1 data call per run)
 STATE_FILE = "state.json"
@@ -104,16 +110,62 @@ def swings(df, kind):
 
 
 def trend_of(d):
-    sh, sl = swings(d, "high"), swings(d, "low")
-    if len(sh) < 2 or len(sl) < 2:
-        return None
-    h_prev, h_last = d["high"][sh[-2]], d["high"][sh[-1]]
-    l_prev, l_last = d["low"][sl[-2]], d["low"][sl[-1]]
-    if h_last < h_prev and l_last < l_prev:
-        return "down"
-    if h_last > h_prev and l_last > l_prev:
-        return "up"
-    return None
+    """Structure-break trend (handles strong impulses straight away).
+    UP once a candle closes above the last confirmed swing high; DOWN once one closes below the
+    last confirmed swing low; it stays that way until the opposite break. None until the first break."""
+    hi, lo, cl = d["high"].values, d["low"].values, d["close"].values
+    known_high = {i + SWING_N: hi[i] for i in swings(d, "high")}   # a swing is known SWING_N candles later
+    known_low = {i + SWING_N: lo[i] for i in swings(d, "low")}
+    trend, last_high, last_low = None, None, None
+    for j in range(len(d)):
+        if j in known_high:
+            last_high = known_high[j]
+        if j in known_low:
+            last_low = known_low[j]
+        if last_high is not None and cl[j] > last_high:
+            trend = "up"
+        elif last_low is not None and cl[j] < last_low:
+            trend = "down"
+    return trend
+
+
+def engulf_series(d):
+    """Trend after each candle, from candle engulfing. A bullish candle is consumed when one of the next
+    ENGULF_4H_WINDOW candles closes below its open -> trend becomes down. A bearish candle consumed by a
+    close above its open -> trend becomes up. Holds until the opposite event."""
+    o, c = d["open"].values, d["close"].values
+    n = len(d)
+    events = {}                                   # candle index where the flip is confirmed -> direction
+    for k in range(n - 1):
+        if c[k] == o[k]:
+            continue
+        bull = c[k] > o[k]
+        for j in range(k + 1, min(k + 1 + ENGULF_4H_WINDOW, n)):
+            if bull and c[j] < o[k]:
+                events[j] = "down"
+                break
+            if not bull and c[j] > o[k]:
+                events[j] = "up"
+                break
+    out, trend = [], None
+    for j in range(n):
+        trend = events.get(j, trend)
+        out.append(trend)
+    return out
+
+
+def engulf_trend(d):
+    series = engulf_series(d)
+    return series[-1] if series else None
+
+
+def compute_trends(part, end):
+    trends = {}
+    for name, minutes in HTF.items():
+        d = resample(part, minutes, end)
+        use_engulf = name == "4H" and TREND_4H_MODE == "engulf"
+        trends[name] = engulf_trend(d) if use_engulf else trend_of(d)
+    return trends
 
 
 def find_short_sweep(sub):
@@ -162,6 +214,42 @@ def save_state(state):
         json.dump(state, f)
 
 
+def backtest(days=3):
+    """Prints every sweep found in the last `days` days, with the trends at that moment and whether
+    it would have alerted. Sends nothing to Telegram. Use it to compare against setups you spotted."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    df5 = closed_only(fetch("5min", FETCH_5M), 5, now)
+    mir = mirror(df5)
+    n = len(df5)
+    start = max(n - int(days * 288), 300)
+    found = 0
+    for t in range(start, n):
+        end = df5["time"][t] + timedelta(minutes=5)
+        for direction, src in (("down", df5), ("up", mir)):
+            lo = max(0, t - 299)
+            res = find_short_sweep(src.iloc[lo:t + 1].reset_index(drop=True))
+            if not res:
+                continue
+            sign = 1 if direction == "down" else -1
+            part = df5.iloc[:t + 1]
+            trends = compute_trends(part, end)
+            ok = len(set(trends.values())) == 1 and trends["4H"] == direction
+            tag = "ALERT" if ok else "blocked (trends)"
+            side = "SHORT" if direction == "down" else "LONG"
+            found += 1
+            print(f"{df5['time'][t]} UTC  {side:5} {res['kind']:12} level {sign * res['level']:.2f} "
+                  f"depth {res['extreme'] - res['level']:.2f}  trends {trends}  -> {tag}")
+    d4 = resample(df5, 240, df5["time"].iloc[-1] + timedelta(minutes=5))
+    ser = engulf_series(d4)
+    flips = sum(1 for a, b in zip(ser, ser[1:]) if b is not None and a is not None and a != b)
+    print(f"\n4H candles (UTC, compare with your chart) and engulf trend; {flips} flips in {len(d4)} candles:")
+    for i in range(max(0, len(d4) - 15), len(d4)):
+        r = d4.iloc[i]
+        print(f"  {r['time']}  open {r['open']:.2f}  close {r['close']:.2f}  trend {ser[i]}")
+    print(f"done: {found} sweeps in the last {days} days (depth filter {MIN_SWEEP_DEPTH}, "
+          f"true-LH rule {REQUIRE_TRUE_LH})")
+
+
 def market_closed(now):
     wd, hr = now.weekday(), now.hour
     return wd == 5 or (wd == 4 and hr >= 22) or (wd == 6 and hr < 22)
@@ -171,6 +259,10 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "test":
         send_telegram("Test alert: your gold bot is connected.")
         print("test message sent")
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "backtest":
+        backtest()
         return
 
     now = datetime.now(timezone.utc)
@@ -185,7 +277,7 @@ def main():
         return
 
     last_end = df5["time"].iloc[-1] + timedelta(minutes=5)
-    trends = {name: trend_of(resample(df5, m, last_end)) for name, m in HTF.items()}
+    trends = compute_trends(df5, last_end)
     print("Trends:", trends)
     values = set(trends.values())
     if len(values) != 1 or None in values:
