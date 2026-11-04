@@ -1,8 +1,8 @@
 """XAUUSD liquidity-sweep alert -> Telegram.
 
 Rules (short side; the long side is the exact mirror):
-  1. 4H, 2H and 1H trends are ALL down. If the three disagree, no alert.
-       - 2H and 1H: "down" after a candle closes below the last confirmed swing low, until a candle
+  1. 4H and 2H trends are BOTH down. If they disagree, no alert.
+       - 2H: "down" after a candle closes below the last confirmed swing low, until a candle
          closes above the last confirmed swing high (up is the mirror).
        - 4H (TREND_4H_MODE = "engulf"): a bullish 4H candle that is consumed (a close below its open)
          by the next 1-2 candles flips the trend to down; a bearish one consumed upward flips it to up.
@@ -33,10 +33,10 @@ REQUIRE_TRUE_LH = False # True = swept level must be a real lower high / higher 
 CHECK_LAST = 3          # re-check last N closed 5m candles, so a delayed run doesn't miss one
 STALE_MINUTES = 30      # ignore data older than this (market closed / feed stuck)
 MIN_SWEEP_DEPTH = 0.50  # dollars the sweep must poke beyond the swept level
-HTF = {"4H": 240, "2H": 120, "1H": 60}  # higher timeframes (minutes) that must all agree
+HTF = {"4H": 240, "2H": 120}  # higher timeframes (minutes) that must agree
 TREND_4H_MODE = "engulf"  # "engulf" = 4H trend from candle engulfing; "structure" = swing-break trend
 ENGULF_4H_WINDOW = 2    # a 4H candle counts as consumed if one of the next N 4H candles closes beyond its open
-HTF_OFFSET_HOURS = 0    # shift higher-timeframe candle boundaries if they don't match your chart
+HTF_OFFSET_HOURS = "auto"  # "auto" = candles start at 17:00 New York time (like TradingView forex/gold); or a number of hours
 FETCH_5M = 4000         # 5m candles fetched; higher timeframes are built from these (1 data call per run)
 STATE_FILE = "state.json"
 # --------------------------------------------------------
@@ -86,10 +86,19 @@ def mirror(df):
     return m
 
 
+def htf_offset():
+    """Where higher-timeframe candles start. TradingView forex/gold days start at 17:00 New York time,
+    which is 22:00 UTC in winter and 21:00 UTC in summer."""
+    if HTF_OFFSET_HOURS != "auto":
+        return pd.Timedelta(hours=HTF_OFFSET_HOURS)
+    ny = datetime.now(ZoneInfo("America/New_York")).utcoffset().total_seconds() / 3600   # -5 winter, -4 summer
+    return pd.Timedelta(hours=(17 - ny) % 4)
+
+
 def resample(df5, minutes, last_end):
     """Build higher-timeframe candles from 5m candles; keep only fully closed ones."""
     r = (df5.set_index("time")
-         .resample(f"{minutes}min", offset=pd.Timedelta(hours=HTF_OFFSET_HOURS))
+         .resample(f"{minutes}min", offset=htf_offset())
          .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
          .dropna()
          .reset_index())
@@ -305,7 +314,7 @@ def main():
                f"Swept level: {level:.2f}\n"
                f"Sweep extreme (stop reference): {extreme:.2f}\n"
                f"Trigger candle closed: {when:%d %b %H:%M} {when.tzname()}\n"
-               f"Trend: 4H {trends['4H']}, 2H {trends['2H']}, 1H {trends['1H']}. Go check the chart.")
+               f"Trend: 4H {trends['4H']}, 2H {trends['2H']}. Go check the chart.")
         send_telegram(msg)
         state["sent"].append(key)
         changed = True
