@@ -258,26 +258,29 @@ def scan(df5, tf, days):
     return out
 
 
-def backtest(days=3):
+def backtest(days=5):
     """Prints every sweep found in the last `days` days with the trends at that moment and whether it
     would have alerted, then compares alerts per day for 5m and 15m sweeps. Sends nothing to Telegram."""
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    df5 = closed_only(fetch("5min", FETCH_5M), 5, now)
+    df5 = closed_only(drop_closed_hours(fetch("5min", FETCH_5M)), 5, now)
     other = 5 if SWEEP_TF != 5 else 15
     results = {tf: scan(df5, tf, days) for tf in (SWEEP_TF, other)}
 
-    print(f"=== {SWEEP_TF}m sweeps, last {days} days (time = candle OPEN, UTC; it closes {SWEEP_TF} min later) ===")
+    print(f"=== {SWEEP_TF}m sweeps, last {days} trading days (time = candle OPEN; it closes {SWEEP_TF} min later) ===")
     for r in results[SWEEP_TF]:
         tag = "ALERT" if r["ok"] else "blocked (trends)"
-        print(f"{r['time']} UTC  {r['side']:5} {r['kind']:12} level {r['level']:.2f} "
-              f"depth {r['depth']:.2f}  trends {r['trends']}  -> {tag}")
+        utc = r["time"].replace(tzinfo=timezone.utc)
+        loc = utc.astimezone(DISPLAY_TZ)
+        print(f"{utc:%a %d %b %H:%M} UTC = {loc:%a %d %b %H:%M} {loc.tzname()}  {r['side']:5} {r['kind']:12} "
+              f"level {r['level']:.2f} depth {r['depth']:.2f}  trends {r['trends']}  -> {tag}")
 
-    print("\n=== alerts per day, by sweep timeframe ===")
+    print(f"\n=== alerts per day ({DISPLAY_TZ.key} dates), by sweep timeframe ===")
     for tf, recs in results.items():
         per_day = {}
         for r in recs:
             if r["ok"]:
-                per_day[r["time"].date()] = per_day.get(r["time"].date(), 0) + 1
+                day = r["time"].replace(tzinfo=timezone.utc).astimezone(DISPLAY_TZ).date()
+                per_day[day] = per_day.get(day, 0) + 1
         days_txt = ", ".join(f"{d} {c}" for d, c in sorted(per_day.items())) or "none"
         print(f"{tf}m (min depth {MIN_SWEEP_DEPTH[tf]}): {sum(per_day.values())} alerts; per day: {days_txt}")
 
@@ -291,9 +294,20 @@ def backtest(days=3):
     print(f"done (true-LH rule {REQUIRE_TRUE_LH})")
 
 
-def market_closed(now):
-    wd, hr = now.weekday(), now.hour
-    return wd == 5 or (wd == 4 and hr >= 22) or (wd == 6 and hr < 22)
+def market_closed(now_utc):
+    """Gold is closed from Friday 17:00 to Sunday 18:00 New York time (22:00 -> 23:00 UTC in winter)."""
+    ny = now_utc.astimezone(ZoneInfo("America/New_York"))
+    wd, hr = ny.weekday(), ny.hour
+    return wd == 5 or (wd == 4 and hr >= 17) or (wd == 6 and hr < 18)
+
+
+def drop_closed_hours(df):
+    """Remove weekend candles. The feed fills the weekend with flat dust candles that would otherwise
+    create fake 4H candles and flip the engulf trend."""
+    t = df["time"].dt.tz_localize("UTC").dt.tz_convert("America/New_York")
+    wd, hr = t.dt.weekday, t.dt.hour
+    closed = (wd == 5) | ((wd == 4) & (hr >= 17)) | ((wd == 6) & (hr < 18))
+    return df[~closed].reset_index(drop=True)
 
 
 def main():
@@ -312,7 +326,7 @@ def main():
         print("market closed")
         return
 
-    df5 = closed_only(fetch("5min", FETCH_5M), 5, now_naive)
+    df5 = closed_only(drop_closed_hours(fetch("5min", FETCH_5M)), 5, now_naive)
     if df5.empty or now_naive - df5["time"].iloc[-1] > timedelta(minutes=STALE_MINUTES):
         print("5m data is stale, skipping")
         return
