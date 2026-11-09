@@ -178,37 +178,52 @@ def compute_trends(part, end):
     return trends
 
 
-def find_short_sweep(sub, min_depth=None):
-    """Does the LAST candle of `sub` complete a sweep of a recent lower high?
-    Returns dict(level, extreme, kind) or None. Uses only candles up to the last one."""
+def find_short_sweep(sub, min_depth=None, trace=None, sign=1):
+    """Does the LAST candle of `sub` complete a sweep of a recent swing high?
+    Returns dict(level, extreme, kind) or None. Uses only candles up to the last one.
+    If `trace` is a list, a line explaining each rejection is appended to it (used by explain mode)."""
     if min_depth is None:
         min_depth = MIN_SWEEP_DEPTH[SWEEP_TF]
+    say = trace.append if trace is not None else (lambda _x: None)
+    T = lambda i: f"{sub['time'][i]:%H:%M}"
     t = len(sub) - 1
     sw = swings(sub, "high")
+    if not sw:
+        say("no confirmed swing level found")
     for pos in range(len(sw) - 1, max(len(sw) - 6, -1), -1):   # latest 5 swing highs
         L = sw[pos]
         P = sub["high"][L]
+        tag = f"level {sign * P:.2f} (swing at {T(L)} UTC)"
         if REQUIRE_TRUE_LH:
             if pos == 0 or not P < sub["high"][sw[pos - 1]]:
+                say(f"{tag}: skipped, not a lower high / higher low")
                 continue
         after = sub.iloc[L + 1:]
         beyond = after[after["high"] > P]
         if beyond.empty:
+            say(f"{tag}: not pierced yet")
             continue
-        s = beyond.index[0]                       # first candle that traded above the level
-        if t - s > ENGULF_WINDOW:
+        s_ = beyond.index[0]                      # first candle that traded beyond the level
+        if t - s_ > ENGULF_WINDOW:
+            say(f"{tag}: first pierced at {T(s_)} UTC, more than {ENGULF_WINDOW} candles ago")
             continue
-        seg = sub.iloc[s:t]                       # candles s .. t-1
-        if (seg["close"] < P).any() or sub["close"][t] >= P:
-            continue                              # already closed back (alerted before) or not yet
-        extreme = sub["high"].iloc[s:t + 1].max()
+        seg = sub.iloc[s_:t]                      # candles s_ .. t-1
+        if (seg["close"] < P).any():
+            say(f"{tag}: pierced at {T(s_)} UTC and already closed back inside earlier")
+            continue
+        if sub["close"][t] >= P:
+            say(f"{tag}: pierced at {T(s_)} UTC, this candle has not closed back inside yet")
+            continue
+        extreme = sub["high"].iloc[s_:t + 1].max()
         if extreme - P < min_depth:
-            continue                              # poke too small to count as a real sweep
-        if t == s:
-            return {"level": P, "extreme": extreme, "kind": "wick sweep"}
-        k = seg["high"].idxmax()                  # candle that made the sweep high
+            say(f"{tag}: pierced at {T(s_)} UTC but depth {extreme - P:.2f} is below the minimum {min_depth}")
+            continue
+        if t == s_:
+            return {"level": P, "extreme": extreme, "kind": "wick sweep", "far": sub["low"][t]}
+        k = seg["high"].idxmax()                  # candle that made the sweep extreme
         if sub["close"][t] < sub["low"][k]:
-            return {"level": P, "extreme": extreme, "kind": "engulf sweep"}
+            return {"level": P, "extreme": extreme, "kind": "engulf sweep", "far": sub["low"][k]}
+        say(f"{tag}: pierced at {T(s_)} UTC, waiting for a close beyond the sweep candle's far end")
     return None
 
 
@@ -252,9 +267,19 @@ def scan(df5, tf, days):
             trends = compute_trends(part, end)
             ok = len(set(trends.values())) == 1 and trends["4H"] == direction
             sign = 1 if direction == "down" else -1
+            conf = "yes (engulf sweep)"
+            if res["kind"] == "wick sweep":
+                conf = f"NO follow-through in next {ENGULF_WINDOW}"
+                for j in range(1, ENGULF_WINDOW + 1):
+                    if t + j >= n:
+                        conf = "too recent to know"
+                        break
+                    if src["close"].iloc[t + j] < res["far"]:      # closes beyond the sweep candle's far end
+                        conf = f"yes, engulfed after {j} candle(s)"
+                        break
             out.append({"time": dfs["time"][t], "side": "SHORT" if direction == "down" else "LONG",
                         "kind": res["kind"], "level": sign * res["level"],
-                        "depth": res["extreme"] - res["level"], "trends": trends, "ok": ok})
+                        "depth": res["extreme"] - res["level"], "trends": trends, "ok": ok, "confirm": conf})
     return out
 
 
@@ -272,8 +297,12 @@ def backtest(days=5):
         utc = r["time"].replace(tzinfo=timezone.utc)
         loc = utc.astimezone(DISPLAY_TZ)
         print(f"{utc:%a %d %b %H:%M} UTC = {loc:%a %d %b %H:%M} {loc.tzname()}  {r['side']:5} {r['kind']:12} "
-              f"level {r['level']:.2f} depth {r['depth']:.2f}  trends {r['trends']}  -> {tag}")
+              f"level {r['level']:.2f} depth {r['depth']:.2f}  trends {r['trends']}  -> {tag}  | follow-through: {r['confirm']}")
 
+    alerts = [r for r in results[SWEEP_TF] if r["ok"]]
+    good = [r for r in alerts if r["confirm"].startswith("yes")]
+    print(f"\n{SWEEP_TF}m alerts with follow-through (sweep candle engulfed within {ENGULF_WINDOW} candles): "
+          f"{len(good)} of {len(alerts)}")
     print(f"\n=== alerts per day ({DISPLAY_TZ.key} dates), by sweep timeframe ===")
     for tf, recs in results.items():
         per_day = {}
@@ -294,6 +323,38 @@ def backtest(days=5):
     print(f"done (true-LH rule {REQUIRE_TRUE_LH})")
 
 
+def explain(start_txt, end_txt):
+    """For each candle on the sweep timeframe between two UTC times, print its prices and why a long or a
+    short sweep was or was not found. Sends nothing to Telegram."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    df5 = closed_only(drop_closed_hours(fetch("5min", FETCH_5M)), 5, now)
+    dfs = sweep_candles(df5, SWEEP_TF)
+    mir = mirror(dfs)
+    t0, t1 = pd.Timestamp(start_txt), pd.Timestamp(end_txt)
+    print(f"=== explain: {SWEEP_TF}m candles from {t0} to {t1} UTC (min depth {MIN_SWEEP_DEPTH[SWEEP_TF]}) ===")
+    for t in range(len(dfs)):
+        ts = dfs["time"][t]
+        if ts < t0 or ts > t1:
+            continue
+        utc = ts.replace(tzinfo=timezone.utc)
+        loc = utc.astimezone(DISPLAY_TZ)
+        r = dfs.iloc[t]
+        end = ts + timedelta(minutes=SWEEP_TF)
+        trends = compute_trends(df5[df5["time"] + timedelta(minutes=5) <= end], end)
+        print(f"\n{utc:%a %d %b %H:%M} UTC = {loc:%H:%M} {loc.tzname()}  open {r['open']:.2f} high {r['high']:.2f} "
+              f"low {r['low']:.2f} close {r['close']:.2f}  trends {trends}")
+        for name, src, sign in (("LONG ", mir, -1), ("SHORT", dfs, 1)):
+            lo = max(0, t - 299)
+            trace = []
+            res = find_short_sweep(src.iloc[lo:t + 1].reset_index(drop=True), MIN_SWEEP_DEPTH[SWEEP_TF], trace, sign)
+            if res:
+                print(f"  {name}: SWEEP FOUND ({res['kind']}) level {sign * res['level']:.2f} depth {res['extreme'] - res['level']:.2f}")
+            else:
+                for line in trace[:3]:
+                    print(f"  {name}: {line}")
+    print("\nend of explain")
+
+
 def market_closed(now_utc):
     """Gold is closed from Friday 17:00 to Sunday 18:00 New York time (22:00 -> 23:00 UTC in winter)."""
     ny = now_utc.astimezone(ZoneInfo("America/New_York"))
@@ -305,7 +366,7 @@ def drop_closed_hours(df):
     """Remove weekend candles. The feed fills the weekend with flat dust candles that would otherwise
     create fake 4H candles and flip the engulf trend."""
     t = df["time"].dt.tz_localize("UTC").dt.tz_convert("America/New_York")
-    wd, hr = t.dt.weekday, t.dt.hour
+    wd, hr = t.dt.dayofweek, t.dt.hour
     closed = (wd == 5) | ((wd == 4) & (hr >= 17)) | ((wd == 6) & (hr < 18))
     return df[~closed].reset_index(drop=True)
 
@@ -314,6 +375,10 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "test":
         send_telegram("Test alert: your gold bot is connected.")
         print("test message sent")
+        return
+
+    if os.environ.get("EXPLAIN_FROM"):
+        explain(os.environ["EXPLAIN_FROM"], os.environ.get("EXPLAIN_TO") or os.environ["EXPLAIN_FROM"])
         return
 
     if len(sys.argv) > 1 and sys.argv[1] == "backtest":
