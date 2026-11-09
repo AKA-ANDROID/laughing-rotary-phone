@@ -37,7 +37,7 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TWELVEDATA_KEY: ${{ secrets.TWELVEDATA_KEY }}
-          DISPLAY_TZ: "UTC"
+          DISPLAY_TZ: "Asia/Kolkata"
       - name: Save state
         run: |
           if [ -n "$(git status --porcelain state.json)" ]; then
