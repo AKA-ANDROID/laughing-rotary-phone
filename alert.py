@@ -13,7 +13,9 @@ Rules (short side; the long side is the exact mirror):
        - engulf sweep: within 3 candles a candle closes below the LOW of the candle that made the sweep high
          (and below the LH).
   4. The sweep must poke at least MIN_SWEEP_DEPTH[SWEEP_TF] beyond the level (filters tiny pokes).
-  5. Alert fires when that closing candle completes.
+  5. Follow-through (REQUIRE_FOLLOW_THROUGH): a wick sweep only alerts once a later candle, within 3 candles,
+     closes beyond the far end of the sweep candle (it is "engulfed"). An engulf sweep already includes this.
+  6. The alert fires when that confirming candle closes.
 A swing high/low = highest/lowest of 2 candles on each side.
 """
 import json
@@ -33,6 +35,7 @@ REQUIRE_TRUE_LH = False # True = swept level must be a real lower high / higher 
 SWEEP_TF = 15           # minutes: candle size used to find sweeps (5 or 15)
 CHECK_MINUTES = 30      # re-check sweep candles closed in the last N minutes, so a delayed run doesn't miss one
 STALE_MINUTES = 30      # ignore data older than this (market closed / feed stuck)
+REQUIRE_FOLLOW_THROUGH = True  # wick sweeps must be engulfed by a later candle (within ENGULF_WINDOW) before alerting
 MIN_SWEEP_DEPTH = {5: 0.50, 15: 1.00}  # dollars the sweep must poke beyond the swept level, per timeframe
 HTF = {"4H": 240, "2H": 120}  # higher timeframes (minutes) that must agree
 TREND_4H_MODE = "engulf"  # "engulf" = 4H trend from candle engulfing; "structure" = swing-break trend
@@ -265,7 +268,7 @@ def scan(df5, tf, days):
                 continue
             part = df5[df5["time"] + timedelta(minutes=5) <= end]
             trends = compute_trends(part, end)
-            ok = len(set(trends.values())) == 1 and trends["4H"] == direction
+            trend_ok = len(set(trends.values())) == 1 and trends["4H"] == direction
             sign = 1 if direction == "down" else -1
             conf = "yes (engulf sweep)"
             if res["kind"] == "wick sweep":
@@ -279,7 +282,9 @@ def scan(df5, tf, days):
                         break
             out.append({"time": dfs["time"][t], "side": "SHORT" if direction == "down" else "LONG",
                         "kind": res["kind"], "level": sign * res["level"],
-                        "depth": res["extreme"] - res["level"], "trends": trends, "ok": ok, "confirm": conf})
+                        "depth": res["extreme"] - res["level"], "trends": trends, "trend_ok": trend_ok,
+                        "ok": trend_ok and (conf.startswith("yes") or not REQUIRE_FOLLOW_THROUGH),
+                        "confirm": conf})
     return out
 
 
@@ -293,16 +298,23 @@ def backtest(days=5):
 
     print(f"=== {SWEEP_TF}m sweeps, last {days} trading days (time = candle OPEN; it closes {SWEEP_TF} min later) ===")
     for r in results[SWEEP_TF]:
-        tag = "ALERT" if r["ok"] else "blocked (trends)"
+        if r["ok"]:
+            tag = "ALERT"
+        elif not r["trend_ok"]:
+            tag = "blocked (trends)"
+        elif r["confirm"].startswith("too recent"):
+            tag = "waiting for follow-through"
+        else:
+            tag = "no alert (no follow-through)"
         utc = r["time"].replace(tzinfo=timezone.utc)
         loc = utc.astimezone(DISPLAY_TZ)
         print(f"{utc:%a %d %b %H:%M} UTC = {loc:%a %d %b %H:%M} {loc.tzname()}  {r['side']:5} {r['kind']:12} "
               f"level {r['level']:.2f} depth {r['depth']:.2f}  trends {r['trends']}  -> {tag}  | follow-through: {r['confirm']}")
 
-    alerts = [r for r in results[SWEEP_TF] if r["ok"]]
-    good = [r for r in alerts if r["confirm"].startswith("yes")]
-    print(f"\n{SWEEP_TF}m alerts with follow-through (sweep candle engulfed within {ENGULF_WINDOW} candles): "
-          f"{len(good)} of {len(alerts)}")
+    passed = [r for r in results[SWEEP_TF] if r["trend_ok"]]
+    alerts = [r for r in passed if r["ok"]]
+    print(f"\n{SWEEP_TF}m: {len(passed)} sweeps passed the trend gate; {len(alerts)} of them had follow-through "
+          f"(sweep candle engulfed within {ENGULF_WINDOW} candles) and would alert")
     print(f"\n=== alerts per day ({DISPLAY_TZ.key} dates), by sweep timeframe ===")
     for tf, recs in results.items():
         per_day = {}
@@ -411,26 +423,46 @@ def main():
     n = len(dfs)
     n_check = max(1, CHECK_MINUTES // SWEEP_TF)
     changed = False
+
+    def sweep_at(j):
+        return find_short_sweep(work.iloc[max(0, j - 299):j + 1].reset_index(drop=True))
+
+    def first_confirm(j, far, upto):
+        """First candle after j (within the window, up to `upto`) closing beyond the sweep candle's far end."""
+        for c in range(j + 1, min(j + ENGULF_WINDOW, upto) + 1):
+            if work["close"].iloc[c] < far:
+                return c
+        return None
+
+    hits = []                                     # (sweep candle, result, confirming candle)
     for t in range(max(n - n_check, 0), n):
-        lo = max(0, t - 299)
-        res = find_short_sweep(work.iloc[lo:t + 1].reset_index(drop=True))
-        if not res:
-            continue
-        key = f"{trend}|{SWEEP_TF}|{dfs['time'][t]}"
+        res = sweep_at(t)
+        if res and (res["kind"] == "engulf sweep" or not REQUIRE_FOLLOW_THROUGH):
+            hits.append((t, res, t))
+        if REQUIRE_FOLLOW_THROUGH:
+            for j in range(max(t - ENGULF_WINDOW, 0), t):
+                rj = sweep_at(j)
+                if rj and rj["kind"] == "wick sweep" and first_confirm(j, rj["far"], t) == t:
+                    hits.append((j, rj, t))
+
+    for j, res, c in hits:
+        key = f"{trend}|{SWEEP_TF}|{dfs['time'][j]}"
         if key in state["sent"]:
             continue
         sign = 1 if trend == "down" else -1
         level, extreme = sign * res["level"], sign * res["extreme"]
-        closed_at = dfs["time"][t] + timedelta(minutes=SWEEP_TF)
-        when = closed_at.replace(tzinfo=timezone.utc).astimezone(DISPLAY_TZ)
+        local = lambda i: (dfs["time"][i] + timedelta(minutes=SWEEP_TF)).replace(tzinfo=timezone.utc).astimezone(DISPLAY_TZ)
         side = "SHORT setup (high swept)" if trend == "down" else "LONG setup (low swept)"
-        msg = (f"XAUUSD {side}\n"
-               f"Type: {SWEEP_TF}m {res['kind']}\n"
-               f"Swept level: {level:.2f}\n"
-               f"Sweep extreme (stop reference): {extreme:.2f}\n"
-               f"Trigger candle closed: {when:%d %b %H:%M} {when.tzname()}\n"
-               f"Trend: 4H {trends['4H']}, 2H {trends['2H']}. Go check the chart.")
-        send_telegram(msg)
+        extra = "" if c == j else f" (engulfed after {c - j} candle{'s' if c - j > 1 else ''})"
+        lines = [f"XAUUSD {side}",
+                 f"Type: {SWEEP_TF}m {res['kind']}{extra}",
+                 f"Swept level: {level:.2f}",
+                 f"Sweep extreme (stop reference): {extreme:.2f}",
+                 f"Sweep candle closed: {local(j):%d %b %H:%M} {local(j).tzname()}"]
+        if c != j:
+            lines.append(f"Confirmed: {local(c):%d %b %H:%M} {local(c).tzname()}")
+        lines.append(f"Trend: 4H {trends['4H']}, 2H {trends['2H']}. Go check the chart.")
+        send_telegram("\n".join(lines))
         state["sent"].append(key)
         changed = True
         print("alert sent:", key)
