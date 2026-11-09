@@ -7,12 +7,12 @@ Rules (short side; the long side is the exact mirror):
        - 4H (TREND_4H_MODE = "engulf"): a bullish 4H candle that is consumed (a close below its open)
          by the next 1-2 candles flips the trend to down; a bearish one consumed upward flips it to up.
          The trend holds until the opposite event.
-  2. On 5m, take the most recent confirmed swing high that is lower than the swing high before it (the LH).
+  2. On the sweep timeframe (SWEEP_TF, 15m by default), take the most recent confirmed swing high (the level).
   3. A candle trades above the LH (the sweep), then price closes back below the LH:
        - wick sweep: the sweep candle itself closes below the LH, or
        - engulf sweep: within 3 candles a candle closes below the LOW of the candle that made the sweep high
          (and below the LH).
-  4. The sweep must poke at least MIN_SWEEP_DEPTH beyond the level (filters tiny 20-cent pokes).
+  4. The sweep must poke at least MIN_SWEEP_DEPTH[SWEEP_TF] beyond the level (filters tiny pokes).
   5. Alert fires when that closing candle completes.
 A swing high/low = highest/lowest of 2 candles on each side.
 """
@@ -30,9 +30,10 @@ SYMBOL = "XAU/USD"
 SWING_N = 2             # candles on each side for a swing high/low
 ENGULF_WINDOW = 3       # max candles after the sweep starts to close back
 REQUIRE_TRUE_LH = False # True = swept level must be a real lower high / higher low (not equal or flat levels)
-CHECK_LAST = 3          # re-check last N closed 5m candles, so a delayed run doesn't miss one
+SWEEP_TF = 15           # minutes: candle size used to find sweeps (5 or 15)
+CHECK_MINUTES = 30      # re-check sweep candles closed in the last N minutes, so a delayed run doesn't miss one
 STALE_MINUTES = 30      # ignore data older than this (market closed / feed stuck)
-MIN_SWEEP_DEPTH = 0.50  # dollars the sweep must poke beyond the swept level
+MIN_SWEEP_DEPTH = {5: 0.50, 15: 1.00}  # dollars the sweep must poke beyond the swept level, per timeframe
 HTF = {"4H": 240, "2H": 120}  # higher timeframes (minutes) that must agree
 TREND_4H_MODE = "engulf"  # "engulf" = 4H trend from candle engulfing; "structure" = swing-break trend
 ENGULF_4H_WINDOW = 2    # a 4H candle counts as consumed if one of the next N 4H candles closes beyond its open
@@ -95,10 +96,10 @@ def htf_offset():
     return pd.Timedelta(hours=(17 - ny) % 4)
 
 
-def resample(df5, minutes, last_end):
+def resample(df5, minutes, last_end, offset=None):
     """Build higher-timeframe candles from 5m candles; keep only fully closed ones."""
     r = (df5.set_index("time")
-         .resample(f"{minutes}min", offset=htf_offset())
+         .resample(f"{minutes}min", offset=htf_offset() if offset is None else offset)
          .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
          .dropna()
          .reset_index())
@@ -177,9 +178,11 @@ def compute_trends(part, end):
     return trends
 
 
-def find_short_sweep(sub):
+def find_short_sweep(sub, min_depth=None):
     """Does the LAST candle of `sub` complete a sweep of a recent lower high?
     Returns dict(level, extreme, kind) or None. Uses only candles up to the last one."""
+    if min_depth is None:
+        min_depth = MIN_SWEEP_DEPTH[SWEEP_TF]
     t = len(sub) - 1
     sw = swings(sub, "high")
     for pos in range(len(sw) - 1, max(len(sw) - 6, -1), -1):   # latest 5 swing highs
@@ -199,7 +202,7 @@ def find_short_sweep(sub):
         if (seg["close"] < P).any() or sub["close"][t] >= P:
             continue                              # already closed back (alerted before) or not yet
         extreme = sub["high"].iloc[s:t + 1].max()
-        if extreme - P < MIN_SWEEP_DEPTH:
+        if extreme - P < min_depth:
             continue                              # poke too small to count as a real sweep
         if t == s:
             return {"level": P, "extreme": extreme, "kind": "wick sweep"}
@@ -223,31 +226,61 @@ def save_state(state):
         json.dump(state, f)
 
 
-def backtest(days=3):
-    """Prints every sweep found in the last `days` days, with the trends at that moment and whether
-    it would have alerted. Sends nothing to Telegram. Use it to compare against setups you spotted."""
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    df5 = closed_only(fetch("5min", FETCH_5M), 5, now)
-    mir = mirror(df5)
-    n = len(df5)
-    start = max(n - int(days * 288), 300)
-    found = 0
+def sweep_candles(df5, tf):
+    """Candles used to look for sweeps (closed candles only)."""
+    if tf == 5:
+        return df5
+    last_end = df5["time"].iloc[-1] + timedelta(minutes=5)
+    return resample(df5, tf, last_end, offset=pd.Timedelta(0))
+
+
+def scan(df5, tf, days):
+    """Find every sweep on `tf`-minute candles over the last `days` days (shorts and longs)."""
+    dfs = sweep_candles(df5, tf)
+    mir = mirror(dfs)
+    n = len(dfs)
+    start = max(n - int(days * 1440 / tf), 100)
+    out = []
     for t in range(start, n):
-        end = df5["time"][t] + timedelta(minutes=5)
-        for direction, src in (("down", df5), ("up", mir)):
+        end = dfs["time"][t] + timedelta(minutes=tf)
+        for direction, src in (("down", dfs), ("up", mir)):
             lo = max(0, t - 299)
-            res = find_short_sweep(src.iloc[lo:t + 1].reset_index(drop=True))
+            res = find_short_sweep(src.iloc[lo:t + 1].reset_index(drop=True), MIN_SWEEP_DEPTH[tf])
             if not res:
                 continue
-            sign = 1 if direction == "down" else -1
-            part = df5.iloc[:t + 1]
+            part = df5[df5["time"] + timedelta(minutes=5) <= end]
             trends = compute_trends(part, end)
             ok = len(set(trends.values())) == 1 and trends["4H"] == direction
-            tag = "ALERT" if ok else "blocked (trends)"
-            side = "SHORT" if direction == "down" else "LONG"
-            found += 1
-            print(f"{df5['time'][t]} UTC  {side:5} {res['kind']:12} level {sign * res['level']:.2f} "
-                  f"depth {res['extreme'] - res['level']:.2f}  trends {trends}  -> {tag}")
+            sign = 1 if direction == "down" else -1
+            out.append({"time": dfs["time"][t], "side": "SHORT" if direction == "down" else "LONG",
+                        "kind": res["kind"], "level": sign * res["level"],
+                        "depth": res["extreme"] - res["level"], "trends": trends, "ok": ok})
+    return out
+
+
+def backtest(days=3):
+    """Prints every sweep found in the last `days` days with the trends at that moment and whether it
+    would have alerted, then compares alerts per day for 5m and 15m sweeps. Sends nothing to Telegram."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    df5 = closed_only(fetch("5min", FETCH_5M), 5, now)
+    other = 5 if SWEEP_TF != 5 else 15
+    results = {tf: scan(df5, tf, days) for tf in (SWEEP_TF, other)}
+
+    print(f"=== {SWEEP_TF}m sweeps, last {days} days (time = candle OPEN, UTC; it closes {SWEEP_TF} min later) ===")
+    for r in results[SWEEP_TF]:
+        tag = "ALERT" if r["ok"] else "blocked (trends)"
+        print(f"{r['time']} UTC  {r['side']:5} {r['kind']:12} level {r['level']:.2f} "
+              f"depth {r['depth']:.2f}  trends {r['trends']}  -> {tag}")
+
+    print("\n=== alerts per day, by sweep timeframe ===")
+    for tf, recs in results.items():
+        per_day = {}
+        for r in recs:
+            if r["ok"]:
+                per_day[r["time"].date()] = per_day.get(r["time"].date(), 0) + 1
+        days_txt = ", ".join(f"{d} {c}" for d, c in sorted(per_day.items())) or "none"
+        print(f"{tf}m (min depth {MIN_SWEEP_DEPTH[tf]}): {sum(per_day.values())} alerts; per day: {days_txt}")
+
     d4 = resample(df5, 240, df5["time"].iloc[-1] + timedelta(minutes=5))
     ser = engulf_series(d4)
     flips = sum(1 for a, b in zip(ser, ser[1:]) if b is not None and a is not None and a != b)
@@ -255,8 +288,7 @@ def backtest(days=3):
     for i in range(max(0, len(d4) - 15), len(d4)):
         r = d4.iloc[i]
         print(f"  {r['time']}  open {r['open']:.2f}  close {r['close']:.2f}  trend {ser[i]}")
-    print(f"done: {found} sweeps in the last {days} days (depth filter {MIN_SWEEP_DEPTH}, "
-          f"true-LH rule {REQUIRE_TRUE_LH})")
+    print(f"done (true-LH rule {REQUIRE_TRUE_LH})")
 
 
 def market_closed(now):
@@ -294,23 +326,27 @@ def main():
         return
     trend = values.pop()
 
-    work = df5 if trend == "down" else mirror(df5)
+    dfs = sweep_candles(df5, SWEEP_TF)
+    work = dfs if trend == "down" else mirror(dfs)
     state = load_state()
-    n = len(df5)
+    n = len(dfs)
+    n_check = max(1, CHECK_MINUTES // SWEEP_TF)
     changed = False
-    for t in range(max(n - CHECK_LAST, 0), n):
-        res = find_short_sweep(work.iloc[:t + 1].reset_index(drop=True))
+    for t in range(max(n - n_check, 0), n):
+        lo = max(0, t - 299)
+        res = find_short_sweep(work.iloc[lo:t + 1].reset_index(drop=True))
         if not res:
             continue
-        key = f"{trend}|{df5['time'][t]}"
+        key = f"{trend}|{SWEEP_TF}|{dfs['time'][t]}"
         if key in state["sent"]:
             continue
         sign = 1 if trend == "down" else -1
         level, extreme = sign * res["level"], sign * res["extreme"]
-        when = df5["time"][t].replace(tzinfo=timezone.utc).astimezone(DISPLAY_TZ)
-        side = "SHORT setup (lower high swept)" if trend == "down" else "LONG setup (higher low swept)"
+        closed_at = dfs["time"][t] + timedelta(minutes=SWEEP_TF)
+        when = closed_at.replace(tzinfo=timezone.utc).astimezone(DISPLAY_TZ)
+        side = "SHORT setup (high swept)" if trend == "down" else "LONG setup (low swept)"
         msg = (f"XAUUSD {side}\n"
-               f"Type: {res['kind']}\n"
+               f"Type: {SWEEP_TF}m {res['kind']}\n"
                f"Swept level: {level:.2f}\n"
                f"Sweep extreme (stop reference): {extreme:.2f}\n"
                f"Trigger candle closed: {when:%d %b %H:%M} {when.tzname()}\n"
